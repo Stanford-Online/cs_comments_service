@@ -39,15 +39,6 @@ class Content
     end
   end
 
-  def self.flagged
-    #return an array of flagged content
-    holder = []
-    Content.where(:abuse_flaggers.ne => [], :abuse_flaggers.exists => true).each do |c|
-      holder << c
-    end
-    holder
-  end
-
   def self.prolific_metric what, count
     #take a hash of criteria (what) and return a hash of hashes
     #course => user => count

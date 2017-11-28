@@ -20,7 +20,7 @@ get "#{APIPREFIX}/flagged_threads" do
   per_page = (params["per_page"] || DEFAULT_PER_PAGE).to_i
   num_pages = [1, (flagged.count / per_page.to_f).ceil].max
   page = [1, page].max
-  flagged_array = flagged.page(page).per(per_page).to_a
+  flagged_array = flagged.paginate(:page => page, :per_page => per_page).to_a
   flagged_threads = []
   flagged_array.each do |f|
     flagged_threads << {
