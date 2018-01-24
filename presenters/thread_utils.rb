@@ -1,4 +1,5 @@
-require 'new_relic/agent/method_tracer'
+require 'logger'
+
 
 module ThreadUtils
 
@@ -42,9 +43,16 @@ module ThreadUtils
   end
 
   class << self
-    include ::NewRelic::Agent::MethodTracer
-    add_method_tracer :get_read_states
-    add_method_tracer :get_endorsed
+    logger = Logger.new(STDOUT)
+    logger.level = Logger::WARN
+    begin
+      require 'new_relic/agent/method_tracer'
+      include ::NewRelic::Agent::MethodTracer
+      add_method_tracer :get_read_states
+      add_method_tracer :get_endorsed
+    rescue LoadError
+      logger.warn "NewRelic agent library not installed"
+    end
   end
 
 end

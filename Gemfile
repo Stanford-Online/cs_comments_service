@@ -3,13 +3,16 @@ ruby "1.9.3"
 
 gem 'pry'
 gem 'pry-nav'
-# gem 'debugger'
+
+# Use with command-line debugging, but not RubyMine
+#gem 'debugger'
 
 gem 'bundler'
 
 gem 'rake'
 
 gem 'sinatra'
+gem 'sinatra-param', '~> 1.4'
 
 gem 'yajl-ruby'
 
@@ -31,8 +34,8 @@ gem 'will_paginate_mongoid', "~>2.0"
 gem 'rdiscount'
 gem 'nokogiri', "~>1.6.8"
 
-gem 'tire', "0.6.2"
-gem 'tire-contrib'
+gem 'elasticsearch', '~> 1.1.2'
+gem 'elasticsearch-model', '~> 0.1.9'
 
 gem 'dalli'
 
@@ -47,6 +50,7 @@ group :test do
   gem 'guard-unicorn'
   gem 'rack-test', :require => 'rack/test'
   gem 'rspec', '~> 2.11.0'
+  gem 'webmock', '~> 1.22'
 end
 
 # FIXME Remove version restriction once ruby upgraded to 2.x

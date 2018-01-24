@@ -16,6 +16,11 @@ require 'yajl'
 require 'support/database_cleaner'
 require 'support/elasticsearch'
 require 'support/factory_girl'
+require 'support/rake'
+require 'support/matchers'
+require 'webmock/rspec'
+
+WebMock.allow_net_connect!
 
 # setup test environment
 set :environment, :test
