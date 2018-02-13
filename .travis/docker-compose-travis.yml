@@ -9,7 +9,7 @@ services:
     image: mongo:3.0.14
     container_name: "mongo.edx"
   forum:
-    image: edxops/forum:latest
+    image: edxops/forum:ruby2.4.1
 
     container_name: forum_testing
     volumes:
