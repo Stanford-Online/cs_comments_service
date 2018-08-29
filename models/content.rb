@@ -1,7 +1,9 @@
 class Content
-
   include Mongoid::Document
   include Mongo::Voteable
+
+  ES_INDEX_NAME = 'content'
+
 
   field :visible, type: Boolean, default: true
   field :abuse_flaggers, type: Array, default: []
@@ -17,16 +19,6 @@ class Content
   index({commentable_id: 1}, {sparse: true, background: true})
 
   scope :flagged, -> { where(:abuse_flaggers.ne => [], :abuse_flaggers.exists => true) }
-
-  ES_INDEX_NAME = 'content'
-
-  def self.put_search_index_mapping(idx=nil)
-    idx ||= self.tire.index
-    success = idx.mapping(self.tire.document_type, {:properties => self.tire.mapping})
-    unless success
-      logger.warn "WARNING! could not apply search index mapping for #{self.name}"
-    end
-  end
 
   before_save :set_username
 
