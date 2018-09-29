@@ -14,6 +14,10 @@ module CommentService
   class << self
     attr_accessor :config
     attr_accessor :blocked_hashes
+
+    def search_enabled?
+      self.config[:enable_search]
+    end
   end
   API_VERSION = 'v1'
   API_PREFIX = "/api/#{API_VERSION}"
@@ -23,19 +27,36 @@ if ENV["ENABLE_GC_PROFILER"]
   GC::Profiler.enable
 end
 
+def get_logger(progname, threshold=nil)
+  logger = Logger.new(STDERR)
+  logger.progname = progname
+  logger.level = threshold || Logger::INFO
+  logger
+end
+
 application_yaml = ERB.new(File.read("config/application.yml")).result()
 CommentService.config = YAML.load(application_yaml).with_indifferent_access
 
-Tire.configure do
-  url CommentService.config[:elasticsearch_server]
-  logger STDERR if ENV["ENABLE_ELASTICSEARCH_DEBUGGING"]
-end
+# Raise sinatra-param exceptions so that we can process, and respond to, them appropriately
+set :raise_sinatra_param_exceptions, true
 
+# Setup Mongo
 Mongoid.load!("config/mongoid.yml", environment)
 Mongoid.logger.level = Logger::INFO
 Mongo::Logger.logger.level = ENV["ENABLE_MONGO_DEBUGGING"] ? Logger::DEBUG : Logger::INFO
 
-# set up i18n
+# Setup Elasticsearch
+# NOTE (CCB): If you want to see all data sent to Elasticsearch (e.g. for debugging purposes), set the tracer argument
+# to the value of a logger.
+# Example: Elasticsearch::Client.new(tracer: get_logger('elasticsearch.tracer'))
+# NOTE: You can also add a logger, but it will log some FATAL warning during index creation.
+# Example: Elasticsearch::Client.new(logger: get_logger('elasticsearch', Logger::WARN))
+Elasticsearch::Model.client = Elasticsearch::Client.new(
+    host: CommentService.config[:elasticsearch_server],
+    log: false
+)
+
+# Setup i18n
 I18n.load_path += Dir[File.join(File.dirname(__FILE__), 'locale', '*.yml').to_s]
 I18n.default_locale = CommentService.config[:default_locale]
 I18n.enforce_available_locales = false
@@ -48,13 +69,9 @@ helpers do
   end
 end
 
-Dir[File.dirname(__FILE__) + '/lib/**/*.rb'].each {|file| require file}
-Dir[File.dirname(__FILE__) + '/models/*.rb'].each {|file| require file}
-Dir[File.dirname(__FILE__) + '/presenters/*.rb'].each {|file| require file}
-
-# Ensure elasticsearch index mappings exist.
-Comment.put_search_index_mapping
-CommentThread.put_search_index_mapping
+Dir[File.dirname(__FILE__) + '/lib/**/*.rb'].each { |file| require file }
+Dir[File.dirname(__FILE__) + '/models/*.rb'].each { |file| require file }
+Dir[File.dirname(__FILE__) + '/presenters/*.rb'].each { |file| require file }
 
 # Comment out observers until notifications are actually set up properly.
 #Dir[File.dirname(__FILE__) + '/models/observers/*.rb'].each {|file| require file}
@@ -106,7 +123,6 @@ class Time
 end
 
 
-
 # these files must be required in order
 require './api/search'
 require './api/commentables'
@@ -138,55 +154,61 @@ error ArgumentError do
   error 400, [env['sinatra.error'].message].to_json
 end
 
-CommentService.blocked_hashes = Content.mongo_client[:blocked_hash].find(nil, projection: {hash: 1}).map {|d| d["hash"]}
+CommentService.blocked_hashes = Content.mongo_client[:blocked_hash].find(nil, projection: {hash: 1}).map { |d| d["hash"] }
 
 def get_db_is_master
   Mongoid::Clients.default.command(isMaster: 1)
 end
 
-def get_es_status
-  res = Tire::Configuration.client.get Tire::Configuration.url
-  JSON.parse res.body
+def elasticsearch_health
+  Elasticsearch::Model.client.cluster.health
+end
+
+
+def is_mongo_available?
+  begin
+    response = get_db_is_master
+    return response.ok? && (response.documents.first['ismaster'] == true)
+  rescue
+    # ignored
+  end
+
+  false
+end
+
+def is_elasticsearch_available?
+  begin
+    health = elasticsearch_health
+    return !health['timed_out'] && %w(yellow green).include?(health['status'])
+  rescue
+    # ignored
+  end
+
+  false
 end
 
 get '/heartbeat' do
-  # mongo is reachable and ready to handle requests
-  db_ok = false
-  begin
-    res = get_db_is_master
-    db_ok = res.ok? && res.documents.first['ismaster'] == true
-  rescue
-  end
-  error 500, JSON.generate({"OK" => false, "check" => "db"}) unless db_ok
-
-  # E_S is reachable and ready to handle requests
-  es_ok = false
-  begin
-    es_status = get_es_status
-    es_ok = es_status["status"] == 200
-  rescue
-  end
-  error 500, JSON.generate({"OK" => false, "check" => "es"}) unless es_ok
-
-  JSON.generate({"OK" => true})
+  error 500, JSON.generate({OK: false, check: :db}) unless is_mongo_available?
+  error 500, JSON.generate({OK: false, check: :es}) unless is_elasticsearch_available?
+  JSON.generate({OK: true})
 end
 
 get '/selftest' do
   begin
     t1 = Time.now
     status = {
-      "db" => get_db_is_master,
-      "es" => get_es_status,
-      "last_post_created" => (Content.last.created_at rescue nil),
-      "total_posts" => Content.count,
-      "total_users" => User.count,
-      "elapsed_time" => Time.now - t1
+        db: get_db_is_master,
+        es: elasticsearch_health,
+        last_post_created: (Content.last.created_at rescue nil),
+        total_posts: Content.count,
+        total_users: User.count,
+        elapsed_time: Time.now - t1
     }
     JSON.generate(status)
   rescue => ex
-    [ 500,
-      {'Content-Type' => 'text/plain'},
-      "#{ex.backtrace.first}: #{ex.message} (#{ex.class})\n\t#{ex.backtrace[1..-1].join("\n\t")}"
+    [500,
+     {'Content-Type' => 'text/plain'},
+     "#{ex.backtrace.first}: #{ex.message} (#{ex.class})\n\t#{ex.backtrace[1..-1].join("\n\t")}"
     ]
   end
 end
