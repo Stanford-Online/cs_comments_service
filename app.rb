@@ -5,6 +5,14 @@ require 'erb'
 Bundler.setup
 Bundler.require
 
+logger = Logger.new(STDOUT)
+logger.level = Logger::WARN
+begin
+  extend ::NewRelic::Agent::Instrumentation::ControllerInstrumentation::ClassMethods
+rescue NameError
+  logger.warn "NewRelic agent library not installed"
+end
+
 env_index = ARGV.index("-e")
 env_arg = ARGV[env_index + 1] if env_index
 environment = env_arg || ENV["SINATRA_ENV"] || "development"
@@ -185,6 +193,12 @@ def is_elasticsearch_available?
   end
 
   false
+end
+
+begin
+  newrelic_ignore '/heartbeat'
+rescue NameError
+  logger.warn "NewRelic agent library not installed"
 end
 
 get '/heartbeat' do
