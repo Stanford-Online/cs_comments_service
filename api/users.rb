@@ -1,5 +1,3 @@
-require 'new_relic/agent/method_tracer'
-
 post "#{APIPREFIX}/users" do
   user = User.new(external_id: params["id"])
   user.username = params["username"]
@@ -56,13 +54,11 @@ get "#{APIPREFIX}/users/:user_id/active_threads" do |user_id|
   collection = presenter.to_hash
 
   json_output = nil
-  self.class.trace_execution_scoped(['Custom/get_user_active_threads/json_serialize']) do
-    json_output = {
-      collection: collection,
-      num_pages: num_pages,
-      page: page,
-    }.to_json
-  end
+  json_output = {
+  collection: collection,
+  num_pages: num_pages,
+  page: page,
+  }.to_json
   json_output
 
 end
@@ -75,4 +71,27 @@ put "#{APIPREFIX}/users/:user_id" do |user_id|
   else
     user.to_hash.to_json
   end
+end
+
+post "#{APIPREFIX}/users/:user_id/read" do |user_id|
+  user.mark_as_read(source)
+  user.reload.to_hash.to_json
+end
+
+post "#{APIPREFIX}/users/:user_id/retire" do |user_id|
+  if not params["retired_username"]
+    error 500, {message: "Missing retired_username param."}.to_json
+  end
+  begin
+    user = User.find_by(external_id: user_id)
+  rescue Mongoid::Errors::DocumentNotFound
+    error 404, {message: "User not found."}.to_json
+  end
+  user.update_attribute(:email, "")
+  user.update_attribute(:notification_ids, [])
+  user.update_attribute(:read_states, [])
+  user.unsubscribe_all
+  user.retire_all_content(params["retired_username"])
+  user.update_attribute(:username, params["retired_username"])
+  user.save
 end

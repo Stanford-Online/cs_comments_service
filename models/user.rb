@@ -1,4 +1,5 @@
-require 'new_relic/agent/method_tracer'
+require 'logger'
+require_relative 'constants'
 
 class User
   include Mongoid::Document
@@ -22,6 +23,9 @@ class User
 
   index( {external_id: 1}, {unique: true, background: true} )
 
+  logger = Logger.new(STDOUT)
+  logger.level = Logger::WARN
+
   def subscriptions_as_source
     Subscription.where(source_id: id.to_s, source_type: self.class.to_s)
   end
@@ -35,84 +39,84 @@ class User
   end
 
   def to_hash(params={})
-    hash = as_document.slice(*%w[username external_id])
+    hash = as_document
+      .slice(USERNAME, EXTERNAL_ID)
+
     if params[:complete]
-      hash = hash.merge("subscribed_thread_ids" => subscribed_thread_ids,
+      hash = hash.merge!("subscribed_thread_ids" => subscribed_thread_ids,
                         "subscribed_commentable_ids" => [], # not used by comment client.  To be removed once removed from comment client.
                         "subscribed_user_ids" => [], # ditto.
                         "follower_ids" => [], # ditto.
                         "id" => id,
                         "upvoted_ids" => upvoted_ids,
                         "downvoted_ids" => downvoted_ids,
-                        "default_sort_key" => default_sort_key
-                       )
+                        "default_sort_key" => default_sort_key)
     end
+
     if params[:course_id]
-      self.class.trace_execution_scoped(['Custom/User.to_hash/count_comments_and_threads']) do
-        if not params[:group_ids].empty?
-          # Get threads in either the specified group(s) or posted to all groups (nil).
-          specified_groups_or_global = params[:group_ids] << nil
-          threads_count = CommentThread.course_context.where(
-            author_id: id,
-            course_id: params[:course_id],
-            group_id: {"$in" => specified_groups_or_global},
-            anonymous: false,
-            anonymous_to_peers: false
-          ).count
+      if not params[:group_ids].empty?
+        # Get threads in either the specified group(s) or posted to all groups (nil).
+        specified_groups_or_global = params[:group_ids] << nil
+        threads_count = CommentThread.course_context.where(
+          author_id: id,
+          course_id: params[:course_id],
+          group_id: {"$in" => specified_groups_or_global},
+          anonymous: false,
+          anonymous_to_peers: false
+        ).count
 
-          # Note that the comments may have been responses to a thread not started by author_id.
+        # Note that the comments may have been responses to a thread not started by author_id.
 
-          # comment.standalone_context? gets the context from the parent comment_thread
-          # we need to eager load the comment_thread to prevent an N+1 when we iterate through the results
-          comment_thread_ids = Comment.includes(:comment_thread).where(
-            author_id: id,
-            course_id: params[:course_id],
-            anonymous: false,
-            anonymous_to_peers: false
-          ).
-          reject{ |comment| comment.standalone_context? }.
-          collect{ |comment| comment.comment_thread_id }
+        # comment.standalone_context? gets the context from the parent comment_thread
+        # we need to eager load the comment_thread to prevent an N+1 when we iterate through the results
+        comment_thread_ids = Comment.includes(:comment_thread).where(
+          author_id: id,
+          course_id: params[:course_id],
+          anonymous: false,
+          anonymous_to_peers: false
+        ).
+        reject{ |comment| comment.standalone_context? }.
+        collect{ |comment| comment.comment_thread_id }
 
-          # Filter to the unique thread ids visible to the specified group(s).
-          group_comment_thread_ids = CommentThread.where(
-            id: {"$in" => comment_thread_ids.uniq},
-            group_id: {"$in" => specified_groups_or_global},
-          ).collect{|d| d.id}
+        # Filter to the unique thread ids visible to the specified group(s).
+        group_comment_thread_ids = CommentThread.where(
+          id: {"$in" => comment_thread_ids.uniq},
+          group_id: {"$in" => specified_groups_or_global},
+        ).collect{|d| d.id}
 
-          # Now filter comment_thread_ids so it only includes things in group_comment_thread_ids
-          # (keeping duplicates so the count will be correct).
-          comments_count = comment_thread_ids.count{
-            |comment_thread_id| group_comment_thread_ids.include?(comment_thread_id)
-          }
+        # Now filter comment_thread_ids so it only includes things in group_comment_thread_ids
+        # (keeping duplicates so the count will be correct).
+        comments_count = comment_thread_ids.count{
+          |comment_thread_id| group_comment_thread_ids.include?(comment_thread_id)
+        }
 
-        else
-          threads_count = CommentThread.course_context.where(
-            author_id: id,
-            course_id: params[:course_id],
-            anonymous: false,
-            anonymous_to_peers: false
-          ).count
-          # comment.standalone_context? gets the context from the parent comment_thread
-          # we need to eager load the comment_thread to prevent an N+1 when we iterate through the results
-          comments_count = Comment.includes(:comment_thread).where(
-            author_id: id,
-            course_id: params[:course_id],
-            anonymous: false,
-            anonymous_to_peers: false
-          ).reject{ |comment| comment.standalone_context? }.count
-        end
-        hash = hash.merge("threads_count" => threads_count, "comments_count" => comments_count)
+      else
+        threads_count = CommentThread.course_context.where(
+          author_id: id,
+          course_id: params[:course_id],
+          anonymous: false,
+          anonymous_to_peers: false
+        ).count
+        # comment.standalone_context? gets the context from the parent comment_thread
+        # we need to eager load the comment_thread to prevent an N+1 when we iterate through the results
+        comments_count = Comment.includes(:comment_thread).where(
+          author_id: id,
+          course_id: params[:course_id],
+          anonymous: false,
+          anonymous_to_peers: false
+        ).reject{ |comment| comment.standalone_context? }.count
       end
+      hash = hash.merge!("threads_count" => threads_count, "comments_count" => comments_count)
     end
     hash
   end
 
   def upvoted_ids
-    Content.up_voted_by(self).map(&:id)
+    Content.up_voted_by(self).pluck(:_id)
   end
 
   def downvoted_ids
-    Content.down_voted_by(self).map(&:id)
+    Content.down_voted_by(self).pluck(:_id)
   end
 
   def followers
@@ -133,17 +137,60 @@ class User
     subscription
   end
 
+  def unsubscribe_all
+    # Unsubscribe this user from all their subscribed threads across all courses.
+    sub_threads = subscribed_threads
+    sub_threads.each {|sub_id| unsubscribe(sub_id) }
+  end
+
+  def all_comments
+    # Returns all comments authored by this user.
+    user_comments = Comment.where(author_id: self._id.to_s)
+    user_comments
+  end
+
+  def all_comment_threads
+    # Returns all comment threads authored by this user.
+    user_comment_threads = CommentThread.where(author_id: self._id.to_s)
+    user_comment_threads
+  end
+
+  def retire_comment(comment, retired_username)
+    # Retire a single comment.
+    comment.update(retired_username: retired_username)
+    comment.update(body: RETIRED_BODY)
+    if comment._type == "CommentThread"
+      comment.update(title: RETIRED_TITLE)
+    end
+    comment.save
+  end
+
+  def retire_all_content(retired_username)
+    # Retire all content authored by this user.
+    user_comments = all_comments
+    user_comment_threads = all_comment_threads
+    user_content = all_comments + all_comment_threads
+    user_content.each {|comment| retire_comment(comment, retired_username)}
+  end
+
   def mark_as_read(thread)
     read_state = read_states.find_or_create_by(course_id: thread.course_id)
     read_state.last_read_times[thread.id.to_s] = Time.now.utc
     read_state.save
   end
 
-  include ::NewRelic::Agent::MethodTracer
-  add_method_tracer :to_hash
-  add_method_tracer :subscribed_thread_ids
-  add_method_tracer :upvoted_ids
-  add_method_tracer :downvoted_ids
+  begin
+    require 'new_relic/agent/method_tracer'
+    include ::NewRelic::Agent::MethodTracer
+    add_method_tracer :to_hash
+    add_method_tracer :subscribed_thread_ids
+    add_method_tracer :upvoted_ids
+    add_method_tracer :downvoted_ids
+    add_method_tracer :subscribe
+    add_method_tracer :mark_as_read
+  rescue LoadError
+    logger.warn "NewRelic agent library not installed"
+  end
 
 end
 
@@ -153,8 +200,9 @@ class ReadState
   field :last_read_times, type: Hash, default: {}
   embedded_in :user
 
-  validates :course_id, uniqueness: true, presence: true
-  
+  validates_presence_of :course_id
+  validates_uniqueness_of :course_id
+
   def to_hash
     to_json
   end

@@ -5,6 +5,14 @@ require 'erb'
 Bundler.setup
 Bundler.require
 
+logger = Logger.new(STDOUT)
+logger.level = Logger::WARN
+begin
+  extend ::NewRelic::Agent::Instrumentation::ControllerInstrumentation::ClassMethods
+rescue NameError
+  logger.warn "NewRelic agent library not installed"
+end
+
 env_index = ARGV.index("-e")
 env_arg = ARGV[env_index + 1] if env_index
 environment = env_arg || ENV["SINATRA_ENV"] || "development"
@@ -14,53 +22,52 @@ module CommentService
   class << self
     attr_accessor :config
     attr_accessor :blocked_hashes
+
+    def search_enabled?
+      self.config[:enable_search]
+    end
   end
   API_VERSION = 'v1'
   API_PREFIX = "/api/#{API_VERSION}"
-end
-
-if ["staging", "production", "loadtest", "edgestage","edgeprod"].include? environment
-  require 'newrelic_rpm'
-  require 'new_relic/agent/method_tracer'
-  Moped::Session.class_eval do
-    include NewRelic::Agent::MethodTracer
-    add_method_tracer :new
-    add_method_tracer :use
-    add_method_tracer :login
-  end
-  Moped::Cluster.class_eval do
-    include NewRelic::Agent::MethodTracer
-    add_method_tracer :with_primary
-    add_method_tracer :nodes
-  end
-  Moped::Node.class_eval do
-    include NewRelic::Agent::MethodTracer
-    add_method_tracer :command
-    add_method_tracer :connect
-    add_method_tracer :flush
-    add_method_tracer :refresh
-  end
 end
 
 if ENV["ENABLE_GC_PROFILER"]
   GC::Profiler.enable
 end
 
+def get_logger(progname, threshold=nil)
+  logger = Logger.new(STDERR)
+  logger.progname = progname
+  logger.level = threshold || Logger::INFO
+  logger
+end
+
 application_yaml = ERB.new(File.read("config/application.yml")).result()
 CommentService.config = YAML.load(application_yaml).with_indifferent_access
 
-Tire.configure do
-  url CommentService.config[:elasticsearch_server]
-  logger STDERR if ENV["ENABLE_ELASTICSEARCH_DEBUGGING"]
-end
+# Raise sinatra-param exceptions so that we can process, and respond to, them appropriately
+set :raise_sinatra_param_exceptions, true
 
+# Setup Mongo
 Mongoid.load!("config/mongoid.yml", environment)
 Mongoid.logger.level = Logger::INFO
-Moped.logger.level = ENV["ENABLE_MOPED_DEBUGGING"] ? Logger::DEBUG : Logger::INFO
+Mongo::Logger.logger.level = ENV["ENABLE_MONGO_DEBUGGING"] ? Logger::DEBUG : Logger::INFO
 
-# set up i18n
+# Setup Elasticsearch
+# NOTE (CCB): If you want to see all data sent to Elasticsearch (e.g. for debugging purposes), set the tracer argument
+# to the value of a logger.
+# Example: Elasticsearch::Client.new(tracer: get_logger('elasticsearch.tracer'))
+# NOTE: You can also add a logger, but it will log some FATAL warning during index creation.
+# Example: Elasticsearch::Client.new(logger: get_logger('elasticsearch', Logger::WARN))
+Elasticsearch::Model.client = Elasticsearch::Client.new(
+    host: CommentService.config[:elasticsearch_server],
+    log: false
+)
+
+# Setup i18n
 I18n.load_path += Dir[File.join(File.dirname(__FILE__), 'locale', '*.yml').to_s]
 I18n.default_locale = CommentService.config[:default_locale]
+I18n.enforce_available_locales = false
 I18n::Backend::Simple.send(:include, I18n::Backend::Fallbacks)
 use Rack::Locale
 
@@ -70,13 +77,9 @@ helpers do
   end
 end
 
-Dir[File.dirname(__FILE__) + '/lib/**/*.rb'].each {|file| require file}
-Dir[File.dirname(__FILE__) + '/models/*.rb'].each {|file| require file}
-Dir[File.dirname(__FILE__) + '/presenters/*.rb'].each {|file| require file}
-
-# Ensure elasticsearch index mappings exist.
-Comment.put_search_index_mapping
-CommentThread.put_search_index_mapping
+Dir[File.dirname(__FILE__) + '/lib/**/*.rb'].each { |file| require file }
+Dir[File.dirname(__FILE__) + '/models/*.rb'].each { |file| require file }
+Dir[File.dirname(__FILE__) + '/presenters/*.rb'].each { |file| require file }
 
 # Comment out observers until notifications are actually set up properly.
 #Dir[File.dirname(__FILE__) + '/models/observers/*.rb'].each {|file| require file}
@@ -97,27 +100,6 @@ before do
   content_type "application/json"
 end
 
-if ENV["ENABLE_IDMAP_LOGGING"]
-
-  after do
-    idmap = Mongoid::Threaded.identity_map
-    vals = {
-      "pid" => Process.pid,
-      "dyno" => ENV["DYNO"],
-      "request_id" => params[:request_id]
-    }
-    idmap.each {|k, v| vals["idmap_count_#{k.to_s}"] = v.size }
-    logger.info vals.map{|e| e.join("=") }.join(" ")
-  end
-
-end
-
-# Enable the identity map. The middleware ensures that the identity map is
-# cleared for every request.
-Mongoid.identity_map_enabled = true
-use Rack::Mongoid::Middleware::IdentityMap
-
-
 # use yajl implementation for to_json.
 # https://github.com/brianmario/yajl-ruby#json-gem-compatibility-api
 #
@@ -128,13 +110,23 @@ require 'yajl/json_gem'
 
 # patch json serialization of ObjectIds to work properly with yajl.
 # See https://groups.google.com/forum/#!topic/mongoid/MaXFVw7D_4s
-module Moped
-  module BSON
-    class ObjectId
-      def to_json
-        self.to_s.to_json
-      end
+# Note that BSON was moved from Moped::BSON::ObjectId to BSON::ObjectId
+module BSON
+  class ObjectId
+    def as_json(options = {})
+      self.to_s
     end
+  end
+end
+
+# Patch json serialization of Time Objects
+class Time
+  # Returns a hash, that will be turned into a JSON object and represent this
+  # object.
+  # Note that this was done to prevent milliseconds from showing up in the JSON response thus breaking
+  # API compatibility for downstream clients.
+  def as_json(options = {})
+    utc().strftime("%Y-%m-%dT%H:%M:%SZ")
   end
 end
 
@@ -158,7 +150,7 @@ if RACK_ENV.to_s == "development"
   end
 end
 
-error Moped::Errors::InvalidObjectId do
+error Mongo::Error::InvalidDocument do
   error 400, [t(:requested_object_not_found)].to_json
 end
 
@@ -170,55 +162,67 @@ error ArgumentError do
   error 400, [env['sinatra.error'].message].to_json
 end
 
-CommentService.blocked_hashes = Content.mongo_session[:blocked_hash].find.select(hash: 1).each.map {|d| d["hash"]}
+CommentService.blocked_hashes = Content.mongo_client[:blocked_hash].find(nil, projection: {hash: 1}).map { |d| d["hash"] }
 
 def get_db_is_master
-  Mongoid::Sessions.default.command(isMaster: 1)
+  Mongoid::Clients.default.command(isMaster: 1)
 end
 
-def get_es_status
-  res = Tire::Configuration.client.get Tire::Configuration.url
-  JSON.parse res.body
+def elasticsearch_health
+  Elasticsearch::Model.client.cluster.health
+end
+
+
+def is_mongo_available?
+  begin
+    response = get_db_is_master
+    return response.ok? && (response.documents.first['ismaster'] == true)
+  rescue
+    # ignored
+  end
+
+  false
+end
+
+def is_elasticsearch_available?
+  begin
+    health = elasticsearch_health
+    return !health['timed_out'] && %w(yellow green).include?(health['status'])
+  rescue
+    # ignored
+  end
+
+  false
+end
+
+begin
+  newrelic_ignore '/heartbeat'
+rescue NameError
+  logger.warn "NewRelic agent library not installed"
 end
 
 get '/heartbeat' do
-  # mongo is reachable and ready to handle requests
-  db_ok = false
-  begin
-    res = get_db_is_master
-    db_ok = ( res["ismaster"] == true and Integer(res["ok"]) == 1 )
-  rescue
-  end
-  error 500, JSON.generate({"OK" => false, "check" => "db"}) unless db_ok
-
-  # E_S is reachable and ready to handle requests
-  es_ok = false
-  begin
-    es_status = get_es_status
-    es_ok = es_status["status"] == 200
-  rescue
-  end
-  error 500, JSON.generate({"OK" => false, "check" => "es"}) unless es_ok
-
-  JSON.generate({"OK" => true})
+  error 500, JSON.generate({OK: false, check: :db}) unless is_mongo_available?
+  error 500, JSON.generate({OK: false, check: :es}) unless is_elasticsearch_available?
+  JSON.generate({OK: true})
 end
 
 get '/selftest' do
   begin
     t1 = Time.now
     status = {
-      "db" => get_db_is_master,
-      "es" => get_es_status,
-      "last_post_created" => (Content.last.created_at rescue nil),
-      "total_posts" => Content.count,
-      "total_users" => User.count,
-      "elapsed_time" => Time.now - t1
+        db: get_db_is_master,
+        es: elasticsearch_health,
+        last_post_created: (Content.last.created_at rescue nil),
+        total_posts: Content.count,
+        total_users: User.count,
+        elapsed_time: Time.now - t1
     }
     JSON.generate(status)
   rescue => ex
-    [ 500,
-      {'Content-Type' => 'text/plain'},
-      "#{ex.backtrace.first}: #{ex.message} (#{ex.class})\n\t#{ex.backtrace[1..-1].join("\n\t")}"
+    [500,
+     {'Content-Type' => 'text/plain'},
+     "#{ex.backtrace.first}: #{ex.message} (#{ex.class})\n\t#{ex.backtrace[1..-1].join("\n\t")}"
     ]
   end
 end
